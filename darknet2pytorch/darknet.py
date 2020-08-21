@@ -8,13 +8,86 @@ import torch.nn as nn
 import numpy as np
 
 
+# feature transform for detection : https://taeu.github.io/paper/deeplearning-paper-yolov3/
+def create_grids(na, ng):
+    gx = torch.arange(ng).repeat(1, ng).reshape(ng, ng)
+    gy = gx.clone().T
+
+    m = na * ng * ng
+    grid = torch.stack((gx, gy), 2).repeat(3, 1, 1).reshape(m, 2)
+    return grid
+
+
+class DarknetYOLOLayer(nn.Module):
+    '''
+    for detection
+    '''
+    def __init__(self, anchors, in_dimH, in_dimW, num_classes):
+
+        super().__init__()
+
+        self.num_anchors = len(anchors)
+        self.anchors = torch.FloatTensor(anchors)
+        self.num_classes = num_classes
+        self.in_dimW = in_dimW
+        self.in_dimH = in_dimH
+
+    def forward(self, x):
+        # x => B, 255, H, W
+        '''
+        정방 행렬만 가능 -> 나중에 수정 예정
+        cuda tensor만 가능 -> 나중에 수정 예정
+        '''
+        stride_H = self.in_dimH // x.size(2)
+        stride_W = self.in_dimW // x.size(3)
+        assert (stride_H == stride_W)
+
+        # 각 변수들
+        nb = x.shape[0]  # number of batch
+        na = self.num_anchors  # number of anchors
+        no = self.num_classes + 5  # 5 : x,y,w,h,conf
+        ng = self.in_dimH // stride_H  # grid size
+        m = na * ng * ng
+        ns = stride_H
+
+        CxCy = create_grids(na, ng).cuda()
+        PwPy = ((self.anchors / ns).view(na, 1, 2).repeat(1, ng * ng,
+                                                          1).view(m,
+                                                                  2)).cuda()
+
+        # (bs, 255, 13, 13) -- > (bs, 3, 13, 13, 85)
+        x = x.view(nb, na, no, ng, ng).permute(0, 1, 3, 4, 2).contiguous()
+        # (bs, 3, 13, 13, 85) --> (bs, 3*13*13, 85)
+        x = x.view(nb, m, no)
+
+        # slicing 좀 상태 안좋음 메모리 문제 때문에, -> 아래 링크 참조
+        # 그래서 아래 슬라이싱 주석처리 해놓음
+        # https://discuss.pytorch.org/t/unable-to-convert-pytorch-model-to-onnx/64158
+        # x[:, :, :2] = torch.sigmoid(x[:, :, :2]) + self.CxCy
+        xy = torch.sigmoid(x[:, :, :2]) + CxCy  #x,y
+
+        # x[:, :, 2:4] = (torch.exp(x[:, :, 2:4]) * self.PwPy ) * self.ns
+        wh = torch.exp(x[:, :, 2:4]) * PwPy  # w,h
+
+        # x[:, :, 4] = torch.sigmoid(x[:, :, 4])
+        confidence = torch.sigmoid(x[:, :, 4]).unsqueeze(2)  # confidence score
+
+        # 논문에서 softmax 안씀, 각클래스는 독립적이라고 여기고
+        # x[:, :, 5:self.no] = torch.sigmoid(x[:, :, 5:self.no])
+        pred_cls = torch.sigmoid(x[:, :, 5:no])  # class
+
+        # confidence에 class prediction 곱해야하는지 말아야하는지 헷갈.. -> 안하는것같다.. ?
+        return torch.cat((xy * ns, wh * ns, confidence, pred_cls), 2)
+        # return torch.cat((xy * ns, wh * ns, confidence, pred_cls * confidence), 2)
+
+
 #for shortcut, route
 class EmptyLayer(nn.Module):
     def __init__(self):
         super(EmptyLayer, self).__init__()
 
 
-def create_modules(blocks):
+def create_modules(blocks, net_info):
     '''
     blocks : output of parse_cfg func. cfg파일에서 파싱한 block들, [net] 제외.
     return : nn.ModuleList() class
@@ -105,7 +178,13 @@ def create_modules(blocks):
                        for i in range(0, len(anchors), 2)]
             anchors = [anchors[i] for i in mask]
 
-            module.add_module(f"YOLOlayer_{index}", EmptyLayer())
+            num_classes = int(block['classes'])
+            in_dimH = int(net_info['height'])
+            in_dimW = int(net_info['width'])
+
+            yololayer = DarknetYOLOLayer(anchors, in_dimH, in_dimW,
+                                         num_classes)
+            module.add_module(f"YOLOlayer_{index}", yololayer)
 
         module_list.append(module)
         prev_filters = filters
@@ -120,7 +199,7 @@ class Darknet(nn.Module):
         self.train_ = not self.inference
 
         self.net_info, self.blocks = parse_cfg(cfg)
-        self.module_list = create_modules(self.blocks)
+        self.module_list = create_modules(self.blocks, self.net_info)
 
         self.header = torch.IntTensor([0, 0, 0, 0])
         self.seen = 0
@@ -172,6 +251,7 @@ class Darknet(nn.Module):
                 outputs[index] = x
 
             elif type_ == "yolo":
+                x = self.module_list[index](x)
                 yolo_out.append(x)
 
         return yolo_out
