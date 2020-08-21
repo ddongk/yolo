@@ -49,6 +49,7 @@ class DarknetYOLOLayer(nn.Module):
         ng = self.in_dimH // stride_H  # grid size
         m = na * ng * ng
         ns = stride_H
+        # print(nb, na, no, ng, m, ns, self.anchors)
 
         CxCy = create_grids(na, ng).cuda()
         PwPy = ((self.anchors / ns).view(na, 1, 2).repeat(1, ng * ng,
@@ -77,8 +78,9 @@ class DarknetYOLOLayer(nn.Module):
         pred_cls = torch.sigmoid(x[:, :, 5:no])  # class
 
         # confidence에 class prediction 곱해야하는지 말아야하는지 헷갈.. -> 안하는것같다.. ?
-        return torch.cat((xy * ns, wh * ns, confidence, pred_cls), 2)
-        # return torch.cat((xy * ns, wh * ns, confidence, pred_cls * confidence), 2)
+        # return torch.cat((xy * ns, wh * ns, confidence, pred_cls), 2)
+        return torch.cat((xy * ns, wh * ns, confidence, pred_cls * confidence),
+                         2)
 
 
 #for shortcut, route
@@ -210,6 +212,7 @@ class Darknet(nn.Module):
     def forward(self, x):
         yolo_out = []
         outputs = {}
+        # print(x.shape)
 
         for index, block in enumerate(self.blocks):
             type_ = block["type"]
@@ -253,8 +256,7 @@ class Darknet(nn.Module):
             elif type_ == "yolo":
                 x = self.module_list[index](x)
                 yolo_out.append(x)
-
-        return yolo_out
+        return torch.cat(yolo_out, 1)
 
     def load_weights(self, weight_file):
         def load_conv_bn(weights, ptr, conv_model, bn_model):
