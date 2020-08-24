@@ -1,5 +1,5 @@
 __pycache__
 .vscode/*
 .ipynb_checkpoints/*
-test_*.ipynb
+test_*
 *_old.py
