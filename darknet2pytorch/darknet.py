@@ -1,11 +1,103 @@
 # https://github.com/ayooshkathuria/pytorch-yolo-v3/blob/master/darknet.py
 # https://github.com/Tianxiaomo/pytorch-YOLOv4/blob/master/tool/darknet2pytorch.py
+# https://github.com/eriklindernoren/PyTorch-YOLOv3/blob/master/models.py
+
 from .parser import parse_cfg
 
 import torch
 import torch.nn as nn
 
-import numpy as np
+
+#for shortcut, route
+class EmptyLayer(nn.Module):
+    def __init__(self):
+        super(EmptyLayer, self).__init__()
+
+
+def create_modules(blocks, net_info):
+    '''
+    blocks : output of parse_cfg func. cfg파일에서 파싱한 block들, [net] 제외.
+    return : nn.ModuleList() class
+    '''
+    module_list = nn.ModuleList()
+    out_filters = [int(net_info['channels'])]  # 모든 레이어의 아웃풋 채널 수
+
+    for index, block in enumerate(blocks):
+        module = nn.Sequential()
+        type_ = block['type']
+
+        #convolution layer
+        if type_ == 'convolutional':
+            activation = block['activation']
+            bn = int(
+                block['batch_normalize'])  # whether to use batchnorm or not
+            filters = int(block['filters'])
+            kernel_size = int(block["size"])
+            stride = int(block["stride"])
+            is_pad = int(block["pad"])
+            pad = (kernel_size - 1) // 2 if is_pad else 0  # for 'same' padding
+            module.add_module(
+                f'conv_{index}',
+                nn.Conv2d(out_filters[-1],
+                          filters,
+                          kernel_size,
+                          stride,
+                          pad,
+                          bias=not bn))
+            if bn:
+                module.add_module(
+                    f'batch_norm_{index}',
+                    nn.BatchNorm2d(filters, momentum=0.9, eps=1e-5))
+
+            if activation == 'leaky':
+                module.add_module(f'leaky_{index}',
+                                  nn.LeakyReLU(0.1, inplace=True))
+            elif activation == 'relu':
+                module.add_module(f'relu_{index}', nn.ReLU(inplace=True))
+
+        #shortcut layer
+        elif type_ == 'shortcut':
+            filters = out_filters[int(block["from"])]
+            module.add_module(f"shortcut_{index}", EmptyLayer())
+            # print(f"shortcut_{index}", filters, int(block["from"]))
+
+        #route layer
+        elif type_ == 'route':
+            layers = list(map(int,
+                              block['layers'].split(',')))  # split 하고 모두 int로
+            # layers = [i if i > 0 else i + index for i in layers]  # i가 음수일경우 양수로 변경 ->굳이 필요 x
+            filters = sum([out_filters[i] for i in layers])
+            module.add_module(f"route_{index}", EmptyLayer())
+            # print(f"route_{index}", [out_filters[i] for i in layers], layers)
+
+        #upsample layer
+        elif type_ == "upsample":
+            #https://itnext.io/implementing-yolo-v3-in-tensorflow-tf-slim-c3c55ff59dbe -> yolo는 nearest 사용
+            # stride = int(x["stride"]) # stride는 다 2라서 걍 주석
+            # expand를 쓰기도 하는데 ....이유는 모르겠다. 맨위 링크 참조
+            # tensor.expand랑 nearest랑 같은 연산인지 확인 해봐야 할 듯
+            upsample = nn.Upsample(scale_factor=2, mode="nearest")
+            module.add_module(f"upsample_{index}", upsample)
+
+        #yolo layer
+        elif type_ == "yolo":
+            mask = list(map(int, block["mask"].split(",")))
+
+            anchors = list(map(int, block["anchors"].split(",")))
+            anchors = [(anchors[i], anchors[i + 1])
+                       for i in range(0, len(anchors), 2)]
+            anchors = [anchors[i] for i in mask]
+
+            num_classes = int(block['classes'])
+
+            img_size = int(net_info['height'])
+
+            yolo_layer = DarknetYOLOLayer(anchors, img_size, num_classes)
+            module.add_module(f"yolo_layer_{index}", yolo_layer)
+
+        module_list.append(module)
+        out_filters.append(filters)
+    return module_list
 
 
 # feature transform for detection : https://taeu.github.io/paper/deeplearning-paper-yolov3/
@@ -22,176 +114,80 @@ class DarknetYOLOLayer(nn.Module):
     '''
     for detection
     '''
-    def __init__(self, anchors, in_dimH, in_dimW, num_classes):
-
+    def __init__(self, anchors, img_size, num_classes):
         super().__init__()
 
-        self.num_anchors = len(anchors)
-        self.anchors = torch.FloatTensor(anchors)
-        self.num_classes = num_classes
-        self.in_dimW = in_dimW
-        self.in_dimH = in_dimH
+        self.anchors = anchors
+        self.na = len(anchors)
+        self.nc = num_classes
+        self.img_size = img_size
+        self.ng = 0
 
-    def forward(self, x):
-        # x => B, 255, H, W
-        '''
-        정방 행렬만 가능 -> 나중에 수정 예정
-        cuda tensor만 가능 -> 나중에 수정 예정
-        '''
-        stride_H = self.in_dimH // x.size(2)
-        stride_W = self.in_dimW // x.size(3)
-        assert (stride_H == stride_W)
+    def compute_grid_offsets(self, ng, cuda=True):
+        self.ng = ng
+        g = self.ng
+        FloatTensor = torch.cuda.FloatTensor if cuda else torch.FloatTensor
+        self.ns = self.img_size / self.ng
+        # Calculate offsets for each grid
+        self.grid_x = torch.arange(g).repeat(g, 1).view([1, 1, g,
+                                                         g]).type(FloatTensor)
+        self.grid_y = torch.arange(g).repeat(g,
+                                             1).t().view([1, 1, g,
+                                                          g]).type(FloatTensor)
+        self.scaled_anchors = FloatTensor([(a_w / self.ns, a_h / self.ns)
+                                           for a_w, a_h in self.anchors])
+        self.anchor_w = self.scaled_anchors[:, 0:1].view((1, self.na, 1, 1))
+        self.anchor_h = self.scaled_anchors[:, 1:2].view((1, self.na, 1, 1))
 
-        # 각 변수들
-        nb = x.shape[0]  # number of batch
-        na = self.num_anchors  # number of anchors
-        no = self.num_classes + 5  # 5 : x,y,w,h,conf
-        ng = self.in_dimH // stride_H  # grid size
-        m = na * ng * ng
-        ns = stride_H
-        # print(nb, na, no, ng, m, ns, self.anchors)
+    # https://github.com/eriklindernoren/PyTorch-YOLOv3/blob/master/models.py
+    # 여기서 퍼옴 아주 깔끔한 코드임 good!
+    def forward(self, x, targets=None):
+        # x => batch, (num_classes+5)*3, H, W
 
-        CxCy = create_grids(na, ng).cuda()
-        PwPy = ((self.anchors / ns).view(na, 1, 2).repeat(1, ng * ng,
-                                                          1).view(m,
-                                                                  2)).cuda()
+        # Tensors for cuda support
+        FloatTensor = torch.cuda.FloatTensor if x.is_cuda else torch.FloatTensor
+        LongTensor = torch.cuda.LongTensor if x.is_cuda else torch.LongTensor
+        ByteTensor = torch.cuda.ByteTensor if x.is_cuda else torch.ByteTensor
 
-        # (bs, 255, 13, 13) -- > (bs, 3, 13, 13, 85)
-        x = x.view(nb, na, no, ng, ng).permute(0, 1, 3, 4, 2).contiguous()
-        # (bs, 3, 13, 13, 85) --> (bs, 3*13*13, 85)
-        x = x.view(nb, m, no)
+        nb = x.size(0)  # number of batch
+        ng = x.size(2)  # grid size
 
-        # slicing 좀 상태 안좋음 메모리 문제 때문에, -> 아래 링크 참조
-        # 그래서 아래 슬라이싱 주석처리 해놓음
-        # https://discuss.pytorch.org/t/unable-to-convert-pytorch-model-to-onnx/64158
-        # x[:, :, :2] = torch.sigmoid(x[:, :, :2]) + self.CxCy
-        xy = torch.sigmoid(x[:, :, :2]) + CxCy  #x,y
+        # (nb, na*no, ng, ng) --> (nb, na, ng, ng, no)
+        prediction = x.view(nb, self.na, self.nc+5, ng, ng)\
+                            .permute(0, 1, 3, 4,2).contiguous()
 
-        # x[:, :, 2:4] = (torch.exp(x[:, :, 2:4]) * self.PwPy ) * self.ns
-        wh = torch.exp(x[:, :, 2:4]) * PwPy  # w,h
+        # If grid size does not match current we compute new offsets
+        if ng != self.ng:
+            self.compute_grid_offsets(ng, cuda=x.is_cuda)
 
-        # x[:, :, 4] = torch.sigmoid(x[:, :, 4])
-        confidence = torch.sigmoid(x[:, :, 4]).unsqueeze(2)  # confidence score
+        # Get outputs
+        x = torch.sigmoid(prediction[..., 0])  # Center x
+        y = torch.sigmoid(prediction[..., 1])  # Center y
+        w = prediction[..., 2]  # Width
+        h = prediction[..., 3]  # Height
+        pred_conf = torch.sigmoid(prediction[..., 4])  # Conf
+        pred_cls = torch.sigmoid(prediction[..., 5:])  # Cls pred.
 
-        # 논문에서 softmax 안씀, 각클래스는 독립적이라고 여기고
-        # x[:, :, 5:self.no] = torch.sigmoid(x[:, :, 5:self.no])
-        pred_cls = torch.sigmoid(x[:, :, 5:no])  # class
+        # Add offset and scale with anchors
+        pred_boxes = FloatTensor(prediction[..., :4].shape)
+        pred_boxes[..., 0] = x.data + self.grid_x
+        pred_boxes[..., 1] = y.data + self.grid_y
+        pred_boxes[..., 2] = torch.exp(w.data) * self.anchor_w
+        pred_boxes[..., 3] = torch.exp(h.data) * self.anchor_h
 
-        # confidence에 class prediction 곱해야하는지 말아야하는지 헷갈.. -> 안하는것같다.. ?
-        # return torch.cat((xy * ns, wh * ns, confidence, pred_cls), 2)
-        return torch.cat((xy * ns, wh * ns, confidence, pred_cls * confidence),
-                         2)
+        output = torch.cat(
+            (
+                pred_boxes.view(nb, -1, 4) * self.ns,
+                pred_conf.view(nb, -1, 1),
+                pred_cls.view(nb, -1, self.nc),
+            ),
+            -1,
+        )
 
-
-#for shortcut, route
-class EmptyLayer(nn.Module):
-    def __init__(self):
-        super(EmptyLayer, self).__init__()
-
-
-def create_modules(blocks, net_info):
-    '''
-    blocks : output of parse_cfg func. cfg파일에서 파싱한 block들, [net] 제외.
-    return : nn.ModuleList() class
-    '''
-
-    module_list = nn.ModuleList()
-
-    prev_filters = 3  # 이전 레이어 채널 수, 초기는 3임
-    out_filters = []  # 모든 레이어의 아웃풋 채널 수
-
-    for index, block in enumerate(blocks):
-
-        module = nn.Sequential()
-
-        type_ = block['type']
-
-        #convolution layer
-        if type_ == 'convolutional':
-            activation = block['activation']
-            batch_norm = int(
-                block['batch_normalize'])  # whether to use batchnorm or not
-            filters = int(block['filters'])
-            kernel_size = int(block["size"])
-            stride = int(block["stride"])
-            is_pad = int(block["pad"])
-            pad = (kernel_size - 1) // 2 if is_pad else 0  # for 'same' padding
-
-            if batch_norm:
-                module.add_module(
-                    f'conv{index}',
-                    nn.Conv2d(prev_filters,
-                              filters,
-                              kernel_size,
-                              stride,
-                              pad,
-                              bias=False))
-                module.add_module(f'bn{index}', nn.BatchNorm2d(filters))
-
-            else:
-                module.add_module(
-                    f'conv{index}',
-                    nn.Conv2d(prev_filters, filters, kernel_size, stride, pad))
-
-            if activation == 'leaky':
-                module.add_module(f'leaky{index}',
-                                  nn.LeakyReLU(0.1, inplace=True))
-            elif activation == 'relu':
-                module.add_module(f'relu{index}', nn.ReLU(inplace=True))
-
-        #shortcut layer
-        elif type_ == 'shortcut':
-            shortcut = EmptyLayer()
-            module.add_module(f"shortcut_{index}", shortcut)
-
-        #route layer
-        elif type_ == 'route':
-            route = EmptyLayer()
-            module.add_module(f"route_{index}", route)
-
-            layers = list(map(int,
-                              block['layers'].split(',')))  # split 하고 모두 int로
-            layers = [i if i > 0 else i + index
-                      for i in layers]  # i가 음수일경우 양수로 변경
-
-            n_layers = len(layers)  # route 할 layer 개수
-
-            if n_layers == 1:  # 이 case랑 shortcut은 분명히 다름 -> 이전 채널 수가 다름
-                filters = out_filters[layers[0]]
-            elif n_layers == 2:
-                filters = out_filters[layers[0]] + out_filters[layers[1]]
-            # elif n_layers == 4:
-
-        #upsample layer
-        elif type_ == "upsample":
-            #https://itnext.io/implementing-yolo-v3-in-tensorflow-tf-slim-c3c55ff59dbe
-            # yolo는 nearest 사용
-            # stride = int(x["stride"]) # stride는 다 2라서 걍 주석
-            # expand를 쓰기도 하는데 ....이유는 모르겠다. 맨위 링크 참조
-            # tensor.expand랑 nearest랑 같은 연산인지 확인 해봐야 할 듯
-            upsample = nn.Upsample(scale_factor=2, mode="nearest")
-            module.add_module(f"upsample_{index}", upsample)
-
-        #yolo layer
-        elif type_ == "yolo":
-            mask = list(map(int, block["mask"].split(",")))
-            anchors = list(map(int, block["anchors"].split(",")))
-            anchors = [(anchors[i], anchors[i + 1])
-                       for i in range(0, len(anchors), 2)]
-            anchors = [anchors[i] for i in mask]
-
-            num_classes = int(block['classes'])
-            in_dimH = int(net_info['height'])
-            in_dimW = int(net_info['width'])
-
-            yololayer = DarknetYOLOLayer(anchors, in_dimH, in_dimW,
-                                         num_classes)
-            module.add_module(f"YOLOlayer_{index}", yololayer)
-
-        module_list.append(module)
-        prev_filters = filters
-        out_filters.append(filters)
-    return module_list
+        if targets is None:
+            return output, 0
+        else:
+            return output
 
 
 class Darknet(nn.Module):
@@ -205,9 +201,6 @@ class Darknet(nn.Module):
 
         self.header = torch.IntTensor([0, 0, 0, 0])
         self.seen = 0
-
-        self.in_dimH = int(self.net_info['height'])  # H
-        self.in_dimW = int(self.net_info['width'])  # W
 
     def forward(self, x):
         yolo_out = []
@@ -255,82 +248,12 @@ class Darknet(nn.Module):
 
             elif type_ == "yolo":
                 x = self.module_list[index](x)
-                yolo_out.append(x)
+                yolo_out.append(x[0])
         return torch.cat(yolo_out, 1)
 
     def load_weights(self, weight_file):
-        def load_conv_bn(weights, ptr, conv_model, bn_model):
-            #Get the number of weights of Batch Norm Layer
-            num_bn_biases = bn_model.bias.numel()
-
-            #Load the weights
-            bn_biases = torch.from_numpy(weights[ptr:ptr + num_bn_biases])
-            ptr += num_bn_biases
-            bn_weights = torch.from_numpy(weights[ptr:ptr + num_bn_biases])
-            ptr += num_bn_biases
-            bn_running_mean = torch.from_numpy(weights[ptr:ptr +
-                                                       num_bn_biases])
-            ptr += num_bn_biases
-            bn_running_var = torch.from_numpy(weights[ptr:ptr + num_bn_biases])
-            ptr += num_bn_biases
-
-            #Cast the loaded weights into dims of model weights.
-            bn_biases = bn_biases.view_as(bn_model.bias.data)
-            bn_weights = bn_weights.view_as(bn_model.weight.data)
-            bn_running_mean = bn_running_mean.view_as(bn_model.running_mean)
-            bn_running_var = bn_running_var.view_as(bn_model.running_var)
-
-            #Copy the data to model
-            bn_model.bias.data.copy_(bn_biases)
-            bn_model.weight.data.copy_(bn_weights)
-            bn_model.running_mean.copy_(bn_running_mean)
-            bn_model.running_var.copy_(bn_running_var)
-
-            #BN이 있으므로 conv의 bias는 필요 없음.
-            #Let us load the weights for the Convolutional layers
-            num_weights = conv_model.weight.numel()
-
-            #Do the same as above for weights
-            conv_weights = torch.from_numpy(weights[ptr:ptr + num_weights])
-            ptr = ptr + num_weights
-
-            conv_weights = conv_weights.view_as(conv_model.weight.data)
-            conv_model.weight.data.copy_(conv_weights)
-            return ptr
-
-        def load_conv(weights, ptr, conv_model):
-            #bn이 없으므로 conv에 bias도 load해야함
-            #Number of biases
-            num_biases = conv_model.bias.numel()
-
-            #Load the weights
-            conv_biases = torch.from_numpy(weights[ptr:ptr + num_biases])
-            ptr = ptr + num_biases
-
-            #reshape the loaded weights according to the dims of the model weights
-            conv_biases = conv_biases.view_as(conv_model.bias.data)
-
-            #Finally copy the data
-            conv_model.bias.data.copy_(conv_biases)
-
-            #Let us load the weights for the Convolutional layers
-            num_weights = conv_model.weight.numel()
-
-            #Do the same as above for weights
-            conv_weights = torch.from_numpy(weights[ptr:ptr + num_weights])
-            ptr = ptr + num_weights
-
-            conv_weights = conv_weights.view_as(conv_model.weight.data)
-            conv_model.weight.data.copy_(conv_weights)
-            return ptr
-
-        # Open the weights file
-        # The first 5 values are header information
-        # 1. Major version number
-        # 2. Minor Version Number
-        # 3. Subversion number
-        # 4,5. Images seen by the network (during training)
         with open(weight_file, "rb") as f:
+            import numpy as np
             header = np.fromfile(f, dtype=np.int32,
                                  count=5)  # First five are header values
             self.header = torch.from_numpy(header)
@@ -338,17 +261,47 @@ class Darknet(nn.Module):
             weights = np.fromfile(f, dtype=np.float32)  # The rest are weights
 
         ptr = 0
-        for i in range(len(self.module_list)):
-            type_ = self.blocks[i]["type"]
-            # print(i, type_)
-
-            if type_ == "convolutional":
-                model = self.module_list[i]
-                bn = int(self.blocks[i]['batch_normalize'])
-                if bn: ptr = load_conv_bn(weights, ptr, model[0], model[1])
-                else: ptr = load_conv(weights, ptr, model[0])
-                # print(ptr, weights.size)
-        print("done")
+        for i, (block, module) in enumerate(zip(self.blocks,
+                                                self.module_list)):
+            if block["type"] == "convolutional":
+                conv_layer = module[0]
+                if block["batch_normalize"]:
+                    # Load BN bias, weights, running mean and running variance
+                    bn_layer = module[1]
+                    num_b = bn_layer.bias.numel()  # Number of biases
+                    # Bias
+                    bn_b = torch.from_numpy(weights[ptr:ptr + num_b]).view_as(
+                        bn_layer.bias)
+                    bn_layer.bias.data.copy_(bn_b)
+                    ptr += num_b
+                    # Weight
+                    bn_w = torch.from_numpy(weights[ptr:ptr + num_b]).view_as(
+                        bn_layer.weight)
+                    bn_layer.weight.data.copy_(bn_w)
+                    ptr += num_b
+                    # Running Mean
+                    bn_rm = torch.from_numpy(weights[ptr:ptr + num_b]).view_as(
+                        bn_layer.running_mean)
+                    bn_layer.running_mean.data.copy_(bn_rm)
+                    ptr += num_b
+                    # Running Var
+                    bn_rv = torch.from_numpy(weights[ptr:ptr + num_b]).view_as(
+                        bn_layer.running_var)
+                    bn_layer.running_var.data.copy_(bn_rv)
+                    ptr += num_b
+                else:
+                    # Load conv. bias
+                    num_b = conv_layer.bias.numel()
+                    conv_b = torch.from_numpy(
+                        weights[ptr:ptr + num_b]).view_as(conv_layer.bias)
+                    conv_layer.bias.data.copy_(conv_b)
+                    ptr += num_b
+                # Load conv. weights
+                num_w = conv_layer.weight.numel()
+                conv_w = torch.from_numpy(weights[ptr:ptr + num_w]).view_as(
+                    conv_layer.weight)
+                conv_layer.weight.data.copy_(conv_w)
+                ptr += num_w
 
     def save_weights(self):
         pass
