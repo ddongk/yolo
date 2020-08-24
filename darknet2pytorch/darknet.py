@@ -204,54 +204,36 @@ class Darknet(nn.Module):
         self.header = torch.IntTensor([0, 0, 0, 0])
         self.seen = 0
 
-    def forward(self, x):
+    def forward(self, x, targets=None):
         yolo_out = []
-        outputs = {}
+        outputs = []
         # print(x.shape)
-
-        for index, block in enumerate(self.blocks):
+        for i, (block, module) in enumerate(zip(self.blocks,
+                                                self.module_list)):
             type_ = block["type"]
-
+            loss = 0
             if type_ in ['convolutional', 'upsample']:
-                x = self.module_list[index](x)
-                outputs[index] = x
+                x = module(x)
 
             # fowarding route layer
             elif type_ == "route":
-                layers = list(map(
-                    int, block['layers'].split(',')))  # split 하고 모두 int로
-                layers = [i if i > 0 else i + index
-                          for i in layers]  # i가 음수일경우 양수로 변경
-
-                n_layers = len(layers)  # route 할 layer 개수
-
-                if n_layers == 1:  # 이 case랑 shortcut은 분명히 다름 -> 이전 채널 수가 다름
-                    x = outputs[layers[0]]
-                    outputs[index] = x
-
-                elif n_layers == 2:
-                    x1 = outputs[layers[0]]
-                    x2 = outputs[layers[1]]
-                    x = torch.cat((x1, x2), 1)
-                    outputs[index] = x
-
-                # elif n_layers == 4:
+                x = torch.cat([outputs[int(layer_i)] \
+                        for layer_i in block["layers"].split(",")], 1)
 
             # forwarding shortcut layer
             elif type_ == 'shortcut':
-                from_ = int(block["from"])
-                from_ = from_ if from_ > 0 else from_ + index
+                x = outputs[-1] + \
+                    outputs[int(block["from"])]  # 바로 이전과 from의 sum
 
-                x = outputs[index - 1] + outputs[from_]  # 바로 이전과 from의 sum
-
-                activation = self.blocks[index]['activation']
-                # if activation == "leaky": # 나중에 추가
-                outputs[index] = x
-
+            # forwarding yolo layer
             elif type_ == "yolo":
-                x = self.module_list[index](x)
-                yolo_out.append(x[0])
-        return torch.cat(yolo_out, 1)
+                print(module)
+                x, yolo_loss = module[0](x, targets)
+                loss += yolo_loss
+                yolo_out.append(x)
+            outputs.append(x)
+        yolo_outputs = torch.cat(yolo_out, 1)
+        return yolo_outputs if targets is None else (loss, yolo_outputs)
 
     def load_weights(self, weight_file):
         # Open the weights file
