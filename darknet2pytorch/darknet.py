@@ -9,6 +9,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+# https://github.com/Tianxiaomo/pytorch-YOLOv4/blob/fe45fb64ba4c21130643f9b2569da7bb667356b3/tool/darknet2pytorch.py#L10
+class Mish(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x):
+        x = x * (torch.tanh(torch.nn.functional.softplus(x)))
+        return x
+
+
 class Upsample(nn.Module):
     """ nn.Upsample is deprecated """
     def __init__(self, scale_factor, mode="nearest"):
@@ -109,6 +119,8 @@ def create_modules(blocks, net_info):
             yolo_layer = DarknetYOLOLayer(anchors, img_size, num_classes)
             module.add_module(f"yolo_layer_{index}", yolo_layer)
 
+        else:
+            print(f'unknwon layer type : {type_}, {index}th')
         module_list.append(module)
         out_filters.append(filters)
     return module_list
