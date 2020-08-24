@@ -6,6 +6,19 @@ from .parser import parse_cfg
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+
+
+class Upsample(nn.Module):
+    """ nn.Upsample is deprecated """
+    def __init__(self, scale_factor, mode="nearest"):
+        super(Upsample, self).__init__()
+        self.scale_factor = scale_factor
+        self.mode = mode
+
+    def forward(self, x):
+        x = F.interpolate(x, scale_factor=self.scale_factor, mode=self.mode)
+        return x
 
 
 #for shortcut, route
@@ -51,9 +64,7 @@ def create_modules(blocks, net_info):
 
             if activation == 'leaky':
                 module.add_module(f'leaky_{index}',
-                                  nn.LeakyReLU(0.1, inplace=True))
-            elif activation == 'relu':
-                module.add_module(f'relu_{index}', nn.ReLU(inplace=True))
+                                  nn.LeakyReLU(0.1, inplace=False))
 
         #shortcut layer
         elif type_ == 'shortcut':
@@ -76,7 +87,10 @@ def create_modules(blocks, net_info):
             # stride = int(x["stride"]) # stride는 다 2라서 걍 주석
             # expand를 쓰기도 하는데 ....이유는 모르겠다. 맨위 링크 참조
             # tensor.expand랑 nearest랑 같은 연산인지 확인 해봐야 할 듯
-            upsample = nn.Upsample(scale_factor=2, mode="nearest")
+            # upsample = nn.Upsample(scale_factor=2, mode="nearest")
+            # module.add_module(f"upsample_{index}", upsample)
+            upsample = Upsample(scale_factor=int(block["stride"]),
+                                mode="nearest")
             module.add_module(f"upsample_{index}", upsample)
 
         #yolo layer
@@ -98,16 +112,6 @@ def create_modules(blocks, net_info):
         module_list.append(module)
         out_filters.append(filters)
     return module_list
-
-
-# feature transform for detection : https://taeu.github.io/paper/deeplearning-paper-yolov3/
-def create_grids(na, ng):
-    gx = torch.arange(ng).repeat(1, ng).reshape(ng, ng)
-    gy = gx.clone().T
-
-    m = na * ng * ng
-    grid = torch.stack((gx, gy), 2).repeat(3, 1, 1).reshape(m, 2)
-    return grid
 
 
 class DarknetYOLOLayer(nn.Module):
@@ -140,7 +144,7 @@ class DarknetYOLOLayer(nn.Module):
         self.anchor_h = self.scaled_anchors[:, 1:2].view((1, self.na, 1, 1))
 
     # https://github.com/eriklindernoren/PyTorch-YOLOv3/blob/master/models.py
-    # 여기서 퍼옴 아주 깔끔한 코드임 good!
+    # 여기서 퍼옴 아주 깔끔한 코드임 good! -> 기존꺼랑 차이는 없음 결과값에서
     def forward(self, x, targets=None):
         # x => batch, (num_classes+5)*3, H, W
 
@@ -191,10 +195,8 @@ class DarknetYOLOLayer(nn.Module):
 
 
 class Darknet(nn.Module):
-    def __init__(self, cfg, inference=False):
+    def __init__(self, cfg):
         super(Darknet, self).__init__()
-        self.inference = inference
-        self.train_ = not self.inference
 
         self.net_info, self.blocks = parse_cfg(cfg)
         self.module_list = create_modules(self.blocks, self.net_info)
@@ -252,6 +254,12 @@ class Darknet(nn.Module):
         return torch.cat(yolo_out, 1)
 
     def load_weights(self, weight_file):
+        # Open the weights file
+        # The first 5 values are header information
+        # 1. Major version number
+        # 2. Minor Version Number
+        # 3. Subversion number
+        # 4,5. Images seen by the network (during training)
         with open(weight_file, "rb") as f:
             import numpy as np
             header = np.fromfile(f, dtype=np.int32,
@@ -303,8 +311,31 @@ class Darknet(nn.Module):
                 conv_layer.weight.data.copy_(conv_w)
                 ptr += num_w
 
-    def save_weights(self):
-        pass
+    def save_darknet_weights(self, path, cutoff=-1):
+        fp = open(path, "wb")
+        self.header_info[3] = self.seen
+        self.header_info.tofile(fp)
+
+        # Iterate through layers
+        for i, (block, module) in enumerate(
+                zip(self.blocks[:cutoff], self.module_list[:cutoff])):
+
+            if module_def["type"] == "convolutional":
+                conv_layer = module[0]
+                # If batch norm, load bn first
+                if module_def["batch_normalize"]:
+                    bn_layer = module[1]
+                    bn_layer.bias.data.cpu().numpy().tofile(fp)
+                    bn_layer.weight.data.cpu().numpy().tofile(fp)
+                    bn_layer.running_mean.data.cpu().numpy().tofile(fp)
+                    bn_layer.running_var.data.cpu().numpy().tofile(fp)
+                # Load conv bias
+                else:
+                    conv_layer.bias.data.cpu().numpy().tofile(fp)
+                # Load conv weights
+                conv_layer.weight.data.cpu().numpy().tofile(fp)
+
+    #     fp.close()
 
 
 if __name__ == "__main__":

@@ -283,8 +283,8 @@ class Darknet(nn.Module):
             #Copy the data to model
             bn_model.bias.data.copy_(bn_biases)
             bn_model.weight.data.copy_(bn_weights)
-            bn_model.running_mean.copy_(bn_running_mean)
-            bn_model.running_var.copy_(bn_running_var)
+            bn_model.running_mean.data.copy_(bn_running_mean)
+            bn_model.running_var.data.copy_(bn_running_var)
 
             #BN이 있으므로 conv의 bias는 필요 없음.
             #Let us load the weights for the Convolutional layers
@@ -350,8 +350,34 @@ class Darknet(nn.Module):
                 # print(ptr, weights.size)
         print("done")
 
-    def save_weights(self):
-        pass
+    # def save_darknet_weights(self, path, cutoff=-1):
+    #     """
+    #         @:param path    - path of the new weights file
+    #         @:param cutoff  - save layers between 0 and cutoff (cutoff = -1 -> all are saved)
+    #     """
+    #     fp = open(path, "wb")
+    #     self.header_info[3] = self.seen
+    #     self.header_info.tofile(fp)
+
+    #     # Iterate through layers
+    #     for i, (module_def, module) in enumerate(
+    #             zip(self.module_defs[:cutoff], self.module_list[:cutoff])):
+    #         if module_def["type"] == "convolutional":
+    #             conv_layer = module[0]
+    #             # If batch norm, load bn first
+    #             if module_def["batch_normalize"]:
+    #                 bn_layer = module[1]
+    #                 bn_layer.bias.data.cpu().numpy().tofile(fp)
+    #                 bn_layer.weight.data.cpu().numpy().tofile(fp)
+    #                 bn_layer.running_mean.data.cpu().numpy().tofile(fp)
+    #                 bn_layer.running_var.data.cpu().numpy().tofile(fp)
+    #             # Load conv bias
+    #             else:
+    #                 conv_layer.bias.data.cpu().numpy().tofile(fp)
+    #             # Load conv weights
+    #             conv_layer.weight.data.cpu().numpy().tofile(fp)
+
+    #     fp.close()
 
 
 if __name__ == "__main__":
