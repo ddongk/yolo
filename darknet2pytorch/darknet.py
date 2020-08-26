@@ -321,6 +321,7 @@ class Darknet(nn.Module):
                 conv_layer.weight.data.copy_(conv_w)
                 ptr += num_w
 
+    # test 필요 아직 안돌려본 코드
     def save_darknet_weights(self, path, cutoff=-1):
         fp = open(path, "wb")
         self.header_info[3] = self.seen
