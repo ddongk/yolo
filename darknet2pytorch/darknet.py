@@ -75,6 +75,12 @@ def create_modules(blocks, net_info):
             if activation == 'leaky':
                 module.add_module(f'leaky_{index}',
                                   nn.LeakyReLU(0.1, inplace=False))
+            elif activation == 'mish':
+                module.add_module(f'mish_{index}', Mish())
+            elif activation == 'linear':
+                pass
+            else:
+                print(f'unknown activation function {activation} at {index}')
 
         #shortcut layer
         elif type_ == 'shortcut':
@@ -103,6 +109,16 @@ def create_modules(blocks, net_info):
                                 mode="nearest")
             module.add_module(f"upsample_{index}", upsample)
 
+        # max pool layer
+        elif type_ == "maxpool":
+            stride = int(block['stride'])
+            size = int(block['size'])
+            if stride == 1 and size % 2:
+                pad = size // 2
+                maxpool = nn.MaxPool2d(size, stride, pad)
+            else:
+                print(f"unknown maxpool condition at {index}")
+            module.add_module(f'maxpool_{index}', maxpool)
         #yolo layer
         elif type_ == "yolo":
             mask = list(map(int, block["mask"].split(",")))
@@ -224,7 +240,7 @@ class Darknet(nn.Module):
                                                 self.module_list)):
             type_ = block["type"]
             loss = 0
-            if type_ in ['convolutional', 'upsample']:
+            if type_ in ['convolutional', 'upsample', 'maxpool']:
                 x = module(x)
 
             # fowarding route layer
