@@ -1,6 +1,6 @@
 __pycache__
 .vscode/*
 .ipynb_checkpoints/*
-# test_*
-# weights/*
+test_*
+weights/*
 *_old.py
