@@ -255,7 +255,7 @@ class Darknet(nn.Module):
 
             # forwarding yolo layer
             elif type_ == "yolo":
-                print(module)
+                # print(module)
                 x, yolo_loss = module[0](x, targets)
                 loss += yolo_loss
                 yolo_out.append(x)
